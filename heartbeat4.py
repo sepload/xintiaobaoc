@@ -1,125 +1,73 @@
-import streamlit as st
-import pandas as pd
+# heartbeat_monitor.py
 import time
-import folium
-from streamlit_folium import st_folium
-import math
-import json
-import os
+import pandas as pd
+import streamlit as st
 from datetime import datetime
-from typing import List, Tuple
 
-st.set_page_config(layout="wide", page_title="无人机监测系统")
+# 初始化数据
+if "heartbeats" not in st.session_state:
+    st.session_state.heartbeats = []
+    st.session_state.last_time = time.time()
+    st.session_state.running = False
 
-# ==================== 坐标转换函数 ====================
-pi = 3.1415926535897932384626
-a = 6378245.0
-ee = 0.00669342162296594323
+st.title("🚁 无人机心跳监测可视化")
 
-def _transform_lat(lng, lat):
-    ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + \
-          0.1 * lng * lat + 0.2 * math.sqrt(abs(lng))
-    ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 *
-            math.sin(2.0 * lng * pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lat * pi) + 40.0 *
-            math.sin(lat / 3.0 * pi)) * 2.0 / 3.0
-    ret += (160.0 * math.sin(lat / 12.0 * pi) + 320 *
-            math.sin(lat * pi / 30.0)) * 2.0 / 3.0
-    return ret
-
-def _transform_lng(lng, lat):
-    ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + \
-          0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
-    ret += (20.0 * math.sin(6.0 * lng * pi) + 20.0 *
-            math.sin(2.0 * lng * pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lng * pi) + 40.0 *
-            math.sin(lng / 3.0 * pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 *
-            math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
-    return ret
-
-def out_of_china(lng, lat):
-    return not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271)
-
-def wgs84_to_gcj02(lng, lat):
-    if out_of_china(lng, lat):
-        return lng, lat
-    dlat = _transform_lat(lng - 105.0, lat - 35.0)
-    dlng = _transform_lng(lng - 105.0, lat - 35.0)
-    radlat = lat / 180.0 * pi
-    magic = math.sin(radlat)
-    magic = 1 - ee * magic * magic
-    sqrtmagic = math.sqrt(magic)
-    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
-    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
-    return lng + dlng, lat + dlat
-
-def gcj02_to_wgs84(lng, lat):
-    if out_of_china(lng, lat):
-        return lng, lat
-    dlat = _transform_lat(lng - 105.0, lat - 35.0)
-    dlng = _transform_lng(lng - 105.0, lat - 35.0)
-    radlat = lat / 180.0 * pi
-    magic = math.sin(radlat)
-    magic = 1 - ee * magic * magic
-    sqrtmagic = math.sqrt(magic)
-    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * pi)
-    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * pi)
-    return lng - dlng, lat - dlat
-
-# ==================== 几何辅助函数 ====================
-def point_to_segment_distance(px, py, x1, y1, x2, y2):
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return math.hypot(px - x1, py - y1)
-    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
-    t = max(0, min(1, t))
-    proj_x = x1 + t * dx
-    proj_y = y1 + t * dy
-    return math.hypot(px - proj_x, py - proj_y)
-
-def get_closest_point_on_segment(px, py, x1, y1, x2, y2):
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return x1, y1
-    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
-    t = max(0, min(1, t))
-    return x1 + t * dx, y1 + t * dy
-
-def perpendicular_point(px, py, x1, y1, x2, y2, offset, direction='left'):
-    dx = x2 - x1
-    dy = y2 - y1
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return px + offset, py + offset
-    ux = dx / length
-    uy = dy / length
-    perp_x = -uy
-    perp_y = ux
-    if direction == 'right':
-        perp_x = uy
-        perp_y = -ux
-    return px + perp_x * offset, py + perp_y * offset
-
-def calculate_avoidance_waypoints(start, end, obstacles, flight_height, safe_radius, strategy):
-    threatening = []
-    for obs in obstacles:
-        if obs['height'] >= flight_height:
-            center_lng = sum(c[0] for c in obs['coords']) / len(obs['coords'])
-            center_lat = sum(c[1] for c in obs['coords']) / len(obs['coords'])
-            dist = point_to_segment_distance(center_lng, center_lat, start[0], start[1], end[0], end[1])
-            max_r = max(math.hypot(c[0]-center_lng, c[1]-center_lat) for c in obs['coords'])
-            if dist < safe_radius + max_r:
-                threatening.append({
-                    'center': (center_lng, center_lat),
-                    'radius': max_r,
-                    'height': obs['height']
-                })
-    if strategy == 'direct' or not threatening:
-        return [start, end]
+# 侧边栏控制
+with st.sidebar:
+    st.header("控制面板")
+    if st.button("▶️ 开始模拟心跳"):
+        st.session_state.running = True
     
-    waypoints = [start]
-    current_start = start
-    threatening.sort(key=lambda x: point_to_segment_distance(x['center'][0], x['center'][1], start[0], start[1], end[0], end[
+    if st.button("⏹️ 停止模拟"):
+        st.session_state.running = False
+    
+    if st.button("🗑️ 清空数据"):
+        st.session_state.heartbeats = []
+        st.session_state.last_time = time.time()
+        st.session_state.running = False
+
+# 生成心跳包
+def generate_heartbeat():
+    seq = len(st.session_state.heartbeats) + 1
+    now = datetime.now()
+    st.session_state.heartbeats.append({
+        "序号": seq,
+        "时间": now,
+        "延迟(秒)": round(time.time() - st.session_state.last_time, 3)
+    })
+    st.session_state.last_time = time.time()
+
+# 自动生成心跳（每秒一个）
+if st.session_state.running:
+    current_time = time.time()
+    if current_time - st.session_state.last_time >= 1:
+        generate_heartbeat()
+        st.rerun()
+
+# 掉线检测
+if len(st.session_state.heartbeats) > 0:
+    last_beat_time = st.session_state.heartbeats[-1]["时间"].timestamp()
+    current_time = time.time()
+    seconds_since_last = current_time - last_beat_time
+    
+    if seconds_since_last > 3:
+        st.error(f"⚠️ 无人机掉线！已 {seconds_since_last:.1f} 秒未收到心跳包！")
+    else:
+        st.success(f"✅ 在线中 | 最后心跳: {seconds_since_last:.1f} 秒前")
+
+# 显示最新心跳信息
+if st.session_state.heartbeats:
+    latest = st.session_state.heartbeats[-1]
+    st.info(f"📡 最新心跳 | 序号: {latest['序号']} | 时间: {latest['时间'].strftime('%H:%M:%S')} | 间隔: {latest['延迟(秒)']}秒")
+
+# 可视化折线图
+df = pd.DataFrame(st.session_state.heartbeats)
+if not df.empty:
+    st.subheader("📊 心跳序号变化趋势")
+    st.line_chart(df.set_index("时间")["序号"], use_container_width=True)
+    
+    # 显示数据表格
+    with st.expander("查看详细数据"):
+        st.dataframe(df)
+else:
+    st.info("点击「开始模拟心跳」启动监测")
